@@ -18,7 +18,7 @@
 
       <header>
         <h1>Thread multi download</h1>
-        <p></p>
+        <p>Android Code Notes</p>
       </header>
 
       <div id="banner">
@@ -40,41 +40,379 @@
       </nav>
       <section>
         <h3>
-<a name="welcome-to-github-pages" class="anchor" href="#welcome-to-github-pages"><span class="octicon octicon-link"></span></a>Welcome to GitHub Pages.</h3>
+<a name="welcome-to-github-pages" class="anchor" href="#welcome-to-github-pages"><span class="octicon octicon-link"></span></a>Multi-Download主要結構分析</h3>
 
-<p>This automatic page generator is the easiest way to create beautiful pages for all of your projects. Author your page content here using GitHub Flavored Markdown, select a template crafted by a designer, and publish. After your page is generated, you can check out the new branch:</p>
+<h6>&#9733;分別使用了以下幾種Function:</h6>
+<ul>
+	<li>執行綫程 : Runnable, Thread</li>
+	<li>管理內存 : LruCache&#60;URL, byte[]&#62;, WeakReference</li>
+	<li>儲存綫程 : BlockingQueue&#60;Runnable&#62;, Queue&#60;Task&#62; (new LinkedBlockingQueue&#60;T&#62;()管理確保綫往安全, 先進先出為主[LIFO])</li>
+	<li>管理綫程 : ThreadPoolExecutor(<p>綫程最少, 綫程最大, 空閑時間, 空閑時間單位, 緩冲隊例, 拒絕時使用對策[default: ThreadPoolExecutor.AbortPolicy()] )</p></li>
+	<li>鎖定綫程 : synchroized(Object){...} 確保variable, function是同步產生的, 防止memory leak</li>
+	<li>下載圖片 : InputStream(), HttpURLConnection(), URL.OpenConnection() </li>
+	<li>壓縮圖片 : BitmapFactory.Options, BitmapFactory.decodeByteArray(byte, start, length, Options)</li>
+</ul>
 
-<pre><code>$ cd your_repo_root/repo_name
-$ git fetch origin
-$ git checkout gh-pages
+<hr>
+
+<h3>&#9733;Image Download Manager</h3>
+<ul>
+	<li>設置及執行所有綫程 － ThreadPoolExecutor, Task[Download Runnable, Decode Runnable]</li>
+	<li>設置LruCache, WeakRefernce</li>
+</ul>
+
+<h4>1. 始初化的變數及綫程</h4>
+<ul><li><i>管理綫程、內存</i></li></ul>
+<pre><code>private static final int MAX_CACHE_SIZE = 1024 * 1024 * 4;
+private static final int KEEP_ALIVE_TIME = 1;
+private static final int CORE_POOL_SIZE = 8;
+private static final int MAXMUM_POOL_SIZE = 8;
+private static final TimeUnit KEEP_ALIVE_TIME_UNIT;
+
+private static int MAX_DECODE_OF_CORE = Runtime.getRuntime().availableProcessors();
+
+private final BlockingQueue&#60;Runnable&#62; mDownloadWorkQueue;
+private final BlockingQueue&#60;Runnable&#62; mDecodeWorkQueue;
+private final Queue&#60;ImTask&#62; mTaskWorkQueue;
+private final ThreadPoolExecutor mDownloadThreadPool;
+private final ThreadPoolExecutor mDecodeThreadPool;
+private final LruCache&#60;URL, byte[]&#62; mImageCache;
+
+mDownloadWorkQueue = new LinkedBlockingQueue&#60;Runnable&#62;();
+mDecodeWorkQueue = new LinkedBlockingQueue&#60;Runnable&#62;();
+mTaskWorkQueue = new LinkedBlockingQueue&#60;ImTask&#62;();
+
+mDownloadThreadPool = new ThreadPoolExecutor(
+	CORE_POOL_SIZE, MAXMUM_POOL_SIZE,
+	KEEP_ALIVE_TIME, KEEP_ALIVE_TIME_UNIT, 
+	mDownloadWorkQueue);
+
+mDecodeThreadPool = new ThreadPoolExecutor(
+	MAX_DECODE_OF_CORE, MAX_DECODE_OF_CORE, 
+	KEEP_ALIVE_TIME, KEEP_ALIVE_TIME_UNIT, 
+	mDecodeWorkQueue);
+
+mImageCache = new LruCache&#60;URL, byte[]&#62;(MAX_CACHE_SIZE){
+	@Override protected int sizeOf(URL key, 
+		byte[] paramArrayOfByte) {
+		return paramArrayOfByte.length;
+	}
+};
 </code></pre>
 
-<p>If you're using the GitHub for Mac, simply sync your repository and you'll see the new branch.</p>
+<h4>2. 宣告static Object</h4>
+<ul><li>永遠佔用memory, 直到Object被改為null, memory才會被釋放</li>
+	<li>多次被使用[new Object()], 而其中的static值被篡改則改動所有new Object中的static的值</li>
+	<li>當程式compile進行時, static值同時又被修改時, 程式會出現leak memory問題, 
+	<p><i>解決方法: static name; static{ name = "aliku"; } 此block方法是防止</i></p></li>
+</ul>
+<pre><code><i>//建立一個Object循環再用</i>
+private static ImDownloadManager mInstance = null;
+static{
+	KEEP_ALIVE_TIME_UNIT = TimeUnit.SECONDS;
+	mInstance = new ImDownloadManager();
+}
+public static ImDownloadManager getInstance(){
+	return mInstance;
+}
+</code></pre>
+<h4>3. 利用Handler改變圖片decode, download的狀態</h4>
+<ul>
+<li>使用Looper.getMainLooper()不斷改變圖片狀態如decoding, downloading等等</li>
+</ul>
+<pre>
+<code>mHandler = new Handler(Looper.getMainLooper()){
+	@Override public void handleMessage(Message msg) {
+	  ImTask task = (ImTask) msg.obj;
+	  CImageView localView = task.getImageView();
+	  if(localView != null){
 
-<h3>
-<a name="designer-templates" class="anchor" href="#designer-templates"><span class="octicon octicon-link"></span></a>Designer Templates</h3>
+  	    URL localURL = localView.getImagePath();
 
-<p>We've crafted some handsome templates for you to use. Go ahead and continue to layouts to browse through them. You can easily go back to edit your page before publishing. After publishing your page, you can revisit the page generator and switch to another theme. Your Page content will be preserved if it remained markdown format.</p>
+	    if(task.getImageURL() == localURL){
+		  <i>//設置download時的各種狀態 (e.g decode, started)</i>
+		switch (msg.what) {
+		case DOWNLOAD_STARTED:
+			localView.setStatusResource(R.drawable.dl_downloading);
+			break;
+		case DOWNLOAD_COMPLETE:
+			localView.setStatusResource(R.drawable.dl_downloadqueued);
+			break;
+		case DECODE_STARTED:
+			localView.setStatusResource(R.drawable.dl_decodecoding);
+			break;
+		case TASK_COMPLETE:
+			localView.setImageBitmap(task.getImage());
+			<i>//回收Task使用的memory及插回Pool例佇</i>
+			recycleTask(task);
+			break;
+		case DOWNLOAD_FAILED:
+			localView.setImageResource(R.drawable.dl_downloadfailed);
+			<i>//回收Task使用的memory及插回Pool例佇</i>
+			recycleTask(task);
+			break;
+		default: super.handleMessage(msg);
+		}
+	  }
+	}
+  }
+};
 
-<h3>
-<a name="rather-drive-stick" class="anchor" href="#rather-drive-stick"><span class="octicon octicon-link"></span></a>Rather Drive Stick?</h3>
+public void handleState(ImTask task, int state){
+	switch (state) {
+	case TASK_COMPLETE:
+		if(task.isCacheEnable()){
+		  mImageCache.put(task.getImageURL(), task.getByteBuffer());
+		}
 
-<p>If you prefer to not use the automatic generator, push a branch named <code>gh-pages</code> to your repository to create a page manually. In addition to supporting regular HTML content, GitHub Pages support Jekyll, a simple, blog aware static site generator written by our own Tom Preston-Werner. Jekyll makes it easy to create site-wide headers and footers without having to copy them across every page. It also offers intelligent blog support and other advanced templating features.</p>
+		Message completeMessage = mHandler.obtainMessage(state, task);
+		completeMessage.sendToTarget();
 
-<h3>
-<a name="authors-and-contributors" class="anchor" href="#authors-and-contributors"><span class="octicon octicon-link"></span></a>Authors and Contributors</h3>
+	break;
+	case DOWNLOAD_COMPLETE:
+		mDecodeThreadPool.execute(task.getImageDecodeRunnable());
+	break;
+	default: mHandler.obtainMessage(state, task).sendToTarget();
+	break;
+	}
+}
+</code>
+</pre>
 
-<p>You can <a href="https://github.com/blog/821" class="user-mention">@mention</a> a GitHub username to generate a link to their profile. The resulting <code>&lt;a&gt;</code> element will link to the contributor's GitHub Profile. For example: In 2007, Chris Wanstrath (<a href="https://github.com/defunkt" class="user-mention">@defunkt</a>), PJ Hyett (<a href="https://github.com/pjhyett" class="user-mention">@pjhyett</a>), and Tom Preston-Werner (<a href="https://github.com/mojombo" class="user-mention">@mojombo</a>) founded GitHub.</p>
+<h4>4. 宣告static function</h4>
+<ul><li>執行綫程、移除綫程</li></ul>
+<pre><code>static public ImTask startDownload(CImageView cImageView, boolean cacheFlag){
+	<i>//每次取得一個綫程就將它再Queue例佇中移除</i>
+	ImTask downloadTask = mInstance.mTaskWorkQueue.poll();
+	if(null == downloadTask){
+	  <i>//如果Task始初化</i>
+	  downloadTask = new ImTask();
+	}
+	downloadTask.initializeDownloadTask(ImDownloadManager.mInstance, 
+				cImageView, cacheFlag);
 
-<h3>
-<a name="support-or-contact" class="anchor" href="#support-or-contact"><span class="octicon octicon-link"></span></a>Support or Contact</h3>
+	downloadTask.setByteBuffer(mInstance.mImageCache.get(
+				downloadTask.getImageURL()));
 
-<p>Having trouble with Pages? Check out the documentation at <a href="http://help.github.com/pages">http://help.github.com/pages</a> or contact <a href="mailto:support@github.com">support@github.com</a> and we’ll help you sort it out.</p>
-      </section>
-      <footer>
-        <p>Project maintained by <a href="https://github.com/aliku">aliku</a></p>
-        <p><small>Hosted on GitHub Pages &mdash; Theme by <a href="https://twitter.com/michigangraham">mattgraham</a></small></p>
-      </footer>
+	if(null == downloadTask.getByteBuffer()){
+		mInstance.mDownloadThreadPool.execute(
+	  			downloadTask.getHTTPDownloadRunnable());
+
+	}else{
+		mInstance.handleState(downloadTask, DOWNLOAD_COMPLETE);
+	}
+	return downloadTask;
+}
+
+static public void removeDownload(ImTask task, URL url){
+	if(task != null &#38;&#38; task.getImageByte().equals(url)){
+		synchronized (mInstance) {
+			Thread thread = task.getCurrentThread();
+			if(null != thread) thread.interrupt();
+		}
+	}
+}
+static public void cancelAll(){
+	ImTask[] taskArray = new ImTask[mInstance.mDownloadWorkQueue.size()];
+	mInstance.mDownloadWorkQueue.toArray(taskArray);
+	int taskArrayLen = taskArray.length;
+
+	synchronized (mInstance) {
+		for(int i=0; i&#60; taskArrayLen; i++){
+			Thread thread = taskArray[i].mThreadThis;
+			if(thread != null) thread.interrupt();
+		}
+	}
+}
+
+public void recycleTask(ImTask task){
+	task.recycle();
+	mTaskWorkQueue.offer(task);
+}
+</code></pre>
+
+<hr>
+
+<h3>&#9733;Task「Download Runnable , Decode Runnable」</h3>
+<h4>1. 宣告基本變數</h4>
+<ul>
+	<li>DownloadManager static Object</li>
+	<li>設置個別功能提供Download Runnable, Decode Runnable傳取</li>
+	<li>設置圖片ImageView, 由ImageView中取得圖片資訊 (Width, Height)</li>
+</ul>
+<pre>
+<code>private WeakReference&#60;CImageView&#62; mImageWeakRef;
+private Bitmap mDecodedImage;
+private URL mImageUrl;
+private byte[] mImageBuffer;
+private int mTargetHeight;
+private int mTargetWidth;
+private boolean mCacheEnable;
+
+Thread mThreadThis;
+private Thread mCurrentThread;
+
+private Runnable mDownloadRunnable;
+private Runnable mDecodeRunnable;
+private static ImDownloadManager mDownloadManager;
+</code></pre>
+
+<h4>2. 設置Object - Image Cache, Download, Decode, static DownloadManager</h4>
+<pre>
+<code>ImTask(){
+	mDownloadRunnable = new ImDownloadRunnable(this);
+	mDecodeRunnable = new ImDecodeRunnable(this);
+	mDownloadManager = ImDownloadManager.getInstance();
+}
+<i>//設置圖片cache, size, download manager</i>
+void initializeDownloadTask(ImDownloadManager downloadManager, CImageView imageView, boolean cacheFlag){
+	mDownloadManager = downloadManager;
+	<i>//取回ImageView之前的cache</i>
+	mImageWeakRef = new WeakReference<CImageView>(imageView);
+	mCacheEnable = cacheFlag;
+	mImageUrl = imageView.getImagePath();
+
+	mTargetWidth = imageView.getWidth();
+	mTargetHeight = imageView.getHeight();
+}
+</code>
+</pre>
+<h4>3. 設置handleState()令Download state/Decode state互相交替</h4>
+<pre>
+<code><i>//將所有State去DownlaodManager</i>
+void handleState(int state){
+	mDownloadManager.handleState(this, state);
+}
+<i>//Decode State</i>
+@Override public void handleDecodeState(int state) {
+	int outState;
+	switch (state) {
+	case ImDecodeRunnable.DECODE_STATE_COMPLETED:
+		outState = ImDownloadManager.TASK_COMPLETE;
+	break;
+	case ImDecodeRunnable.DECODE_STATE_FAILDED:
+		outState = ImDownloadManager.DOWNLOAD_FAILED;
+	break;
+	default:
+		outState = ImDecodeRunnable.DECODE_STATE_STARTED;
+	break;
+	}
+	handleState(outState);
+}
+<i>//Download State</i>
+@Override public void handleDownloadState(int state) {
+	int outState;
+	switch (state) {
+	case ImDownloadRunnable.HTTP_STATE_COMPLETED:
+		outState = ImDownloadManager.DOWNLOAD_COMPLETE;
+	break;
+	case ImDownloadRunnable.HTTP_STATE_FAILED:
+		outState = ImDownloadManager.DOWNLOAD_FAILED;
+	break;
+	default:
+		outState = ImDownloadManager.DOWNLOAD_STARTED;
+	break;
+	}
+	handleState(outState);
+}
+</code>
+</pre>
+
+<h4>4. 其他會外部傳取的function</h4>
+<ul><li>setCurrentThread()分別處理Download, Decode兩個Thread</li></ul>
+<pre>
+<code><i>//取得及設置的Download, Decode中的Thread.currentThread();</i>
+public void setCurrentThread(Thread thread){
+	synchronized(mDownloadManager){
+		mCurrentThread = thread;
+	}
+}
+<i>//在ImageView setImageUrl -> startDownload -> return task ->ImageView OnDraw完之後設置Task Object</i>
+public Thread getCurrentThread(){
+	synchronized(mDownloadManager){
+		return mCurrentThread;
+	}
+}
+<i>//提供兩個Runnable傳遞到DownloadManager startDownload() -> pool -> Execute</i>
+Runnable getHTTPDownloadRunnable(){
+	return mDownloadRunnable;
+}
+Runnable getImageDecodeRunnable(){
+	return mDecodeRunnable;
+}
+</code>
+</pre>
+
+<hr>
+<h3>Custom ImageView</h3>
+
+<h4>1. 下載及設置圖片cache</h4>
+<ul>
+	<li>設置及傳取圖片cache</li>
+	<li>執行所有Task</li>
+</ul>
+<pre>
+<code>@Override protected void onDraw(Canvas canvas) {
+	if( (!mIsDraw) &#38;&#38; (mImageUrl != null) ){
+		mTask = ImDownloadManager.startDownload(this, mCacheFlag);
+		mIsDraw = true;
+	}
+	super.onDraw(canvas);
+}
+public void setImageURL(URL imageUrl, boolean cacheFlag, Drawable imageDrawable){
+	if(mImageUrl != null) {
+		if(!mImageUrl.equals(mImageUrl)){ //if not found the image url
+			<i>//static mInstance remove task</i>
+			ImDownloadManager.removeDownload(mTask, mImageUrl);
+		}else{
+			return;
+		}
+	}
+	setImageDrawable(imageDrawable);
+	mImageUrl = imageUrl;
+	if( (mIsDraw) &#38;&#38; (imageUrl != null) ){
+		mCacheFlag = cacheFlag;
+		mTask = ImDownloadManager.startDownload(this, cacheFlag);
+	}
+}
+</code>
+</pre>
+
+<h4>2. ImageView顯示或消失</h4>
+<pre>
+<code><i>//onAttachedToWindow只會運行一次</i>
+@Override protected void onAttachedToWindow() {
+	super.onAttachedToWindow();
+	
+	if( (mHideShowResId != -1) &#38;&#38; ((getParent() instanceof View)) ){
+		<i>//設置最底個層View</i>
+		View localView = ((View) getParent()).findViewById(this.mHideShowResId);
+		if(localView != null){
+			<i>//設置View放入Reference</i>
+			this.mThisView = new WeakReference&#60;View&#62;(localView);
+		}
+	}
+}
+<i>//每當View被移除或不在顯示中會觸發</i>
+@Override protected void onDetachedFromWindow() {
+	setImageURL(null, false, null);
+	
+	Drawable localDrawable = getDrawable();
+	if(localDrawable != null){
+		<i>//防止System自動Callback</i>
+		localDrawable.setCallback(null);
+	}
+	if(mThisView != null){
+		mThisView.clear();
+		mThisView = null;
+	}
+	
+	this.mTask = null;
+	super.onDetachedFromWindow();
+}		
+</code>
+</pre>
+
     </div>
     <!--[if !IE]><script>fixScale(document);</script><![endif]-->
     
