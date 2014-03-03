@@ -121,7 +121,7 @@ public static ImDownloadManager getInstance(){
 <li>使用Looper.getMainLooper()不斷改變圖片狀態如decoding, downloading等等</li>
 </ul>
 <pre>
-<code>mHandler = new Handler(Looper.getMainLooper()){
+<span class="no">mHandler</span> = new Handler(Looper.getMainLooper()){
 	@Override public void handleMessage(Message msg) {
 	  ImTask task = (ImTask) msg.obj;
 	  CImageView localView = task.getImageView();
@@ -176,7 +176,6 @@ public void handleState(ImTask task, int state){
 	break;
 	}
 }
-</code>
 </pre>
 
 <h4>4. 宣告static function</h4>
